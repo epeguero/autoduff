@@ -1,0 +1,5 @@
+matplotlib
+colorlog
+pytest
+bitstring
+torch==1.7.0
