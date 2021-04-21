@@ -32,7 +32,7 @@ def self_compose(n, f):
     return self_compose_rec(n, f)
 
 def parse_torch_dtype(s):
-    return {'float32':torch.float32, 'float64':torch.float64}[s]
+    return {'float16':torch.float16, 'float32':torch.float32, 'float64':torch.float64}[s]
 
 def torch_funs(f_name):
     f_torch = lookup_torch_func(f_name)
@@ -53,7 +53,7 @@ def generate_loss_funs(torch_fun_name, dtype, device, compose=0):
         return abs(f(x) - g(x)) * scaling
 
     def loss_grad(f, f_grad, g, g_grad, x):
-        return ((f(x) - g(x)) * (f_grad(x) - g_grad(x))) / abs(f(x) - g(x)) * scaling
+        return (scaling * ((f(x) - g(x)) * (f_grad(x) - g_grad(x)))) / (abs(f(x) - g(x)) * scaling) * scaling
 
     # def rel(a, b):
     #     return (a-b)/b
@@ -118,7 +118,7 @@ def fuzz_1param(loss, sgx_step, seed_input, loss_grad_fun, total_time=100, norma
     loss_vals = OrderedDict()
     for time in range(total_time):
         # log.info("iteration {}/{}".format(time, total_time))
-        loss_vals[time] = (x, loss(x))
+        loss_vals[time] = (x.clone().detach(), loss(x).clone().detach())
 
         # log.info("x = {}".format(x))
         # log.info("loss = {}".format(loss_vals[time][1]))
@@ -129,7 +129,8 @@ def fuzz_1param(loss, sgx_step, seed_input, loss_grad_fun, total_time=100, norma
             x = downcast(next_x)
 
             if torch.isnan(x).sum() > 0:
-                raise Exception("fuzzer encountered NaN value at iteration {}".format(time))
+                log.info("[[ NaN ]]: Ending fuzz at iteration {}".format(time))
+                return loss_vals
 
             # end normalized sga search if we escape [0, 1)
             # We could continue with a random seed, but then fuzzing can devolve into random search
@@ -164,7 +165,7 @@ def detect_grad_anomaly(torchFunName, dtype, device, mode='sga', normalized=Fals
         alpha = 1.2
         sga_step = lambda time, x, grad: x + grad
         _, torchFunSig, torch_fun = lookup_torch_function(torchFunName)
-        seed_inputs = generate_inputs_from_fun_sig(torchFunSig, dtype, device, normalized=normalized)
+        seed_inputs = generate_inputs_from_fun_sig(torchFunSig, dtype, device)
         return fuzz_1param(loss_fun, sga_step, seed_inputs[0], loss_grad_fun, total_time=100)
     elif mode == 'random':
         return random_search(loss_fun, dtype, device)
@@ -188,27 +189,34 @@ def gradient_anomaly_detector():
 
 
 def gradient_anomaly_detector_par(mode='sga', normalized=False, strict=False):
-    search_algo = lambda *fun: detect_grad_anomaly(*fun, mode=mode, normalized=normalized)
     results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_fun = {executor.submit(search_algo, *fun): fun for fun in tvm_compatible_torch_funs()}
+    # executor = concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=torch.multiprocessing.get_context('spawn'))
+    # with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        # search_algo = lambda *fun: detect_grad_anomaly(*fun, mode=mode)
+        # future_to_fun = {executor.submit(search_algo, *fun): fun for fun in tvm_compatible_torch_funs()}
+        # TODO: get mode keyword to work!
+    with concurrent.futures.ProcessPoolExecutor(max_workers=6, mp_context=torch.multiprocessing.get_context('spawn')) as executor:
+        future_to_fun = {executor.submit(detect_grad_anomaly, *fun, mode=mode): fun for fun in tvm_compatible_torch_funs() if fun[2] == 'cuda:0'}
         for future in concurrent.futures.as_completed(future_to_fun):
             fun = future_to_fun[future]
             try:
+                print('Collecting results with "{}" mode in: {} ({}, {})'.format(mode, *fun))
                 search_results = future.result()
                 if not strict:
-                    max_point = max([point for point in search_results.values(0)], key=lambda point: point[1])
-                    tuned_max_point = post_search_tuning(max_point)
+                    max_point = max([point for point in search_results.values()], key=lambda point: point[1])
+                    tuned_max_point = post_search_tuning(*fun, max_point[0])
                     if tuned_max_point[1] > 0.:
                         results[fun] = tuned_max_point
+                        print("max point: ", tuned_max_point)
                 # TODO: implement strict sga. The priority here is to strictly use sga to find a maximum (as a means of measuring sga's effectiveness),
                 # rather than to find the maximum among all seen points
                 # if strict and mode=='sga_strict':
                 #     last_point = list(search_results.values(0))[-1]
 
-                print('FINISHED: {} ({}, {})'.format(*fun))
+                print('[[FINISHED]]')
             except Exception as e:
                 print("Anomaly Detector Exception:\n{}".format(str(e)))
+                raise
 
     sorted_results = sorted(results.items(), key=lambda item: item[1][1])
     print(sorted_results)
@@ -217,7 +225,7 @@ def gradient_anomaly_detector_par(mode='sga', normalized=False, strict=False):
 
 def post_search_tuning(funName, dtype, device, x_center):
     torch_dtype = parse_torch_dtype(dtype)
-    torch_float_apply = lambda f, x: f(torch.tensor(x).to(torch_dtype).to(device)).item()
+    torch_float_apply = lambda f, x: f(x.to(torch_dtype).to(device)).item()
     _, _, f_torch = lookup_torch_function(funName)
     f_tvm, _, _ = torch_to_tvm(funName, dtype, device)
 

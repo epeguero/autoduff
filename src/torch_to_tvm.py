@@ -21,6 +21,9 @@ import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 
+import sys
+import traceback
+
 # PATCH:
 # some imported functions have a missing '__module__',
 # which is expected by the torch to tvm conversion
@@ -93,14 +96,14 @@ def eval_tvm_mod_fun(mod, xs, dtype='float32', device='cpu', fun='main'):
     # results in 'function expected 1 argument, got 0' error
     mod = transform.Sequential([relay.transform.InferType()])(mod)
     with tvm.transform.PassContext(opt_level=3, disabled_pass=["FoldScaleAxis"]):
-        ctx = tvm.cpu() if device == 'cpu' else tvm.gpu()
+        tvm_device = tvm.cpu() if device == 'cpu' else tvm.gpu()
         target = tvm.target.arm_cpu() if device == 'cpu' else tvm.target.cuda()
         # Only CPU tensor can be converted to numpy
         # This is fine even for GPU, since the tvm evaluator will target the device parameter
-        tvm_xs = [tvm.relay.const(tvm.nd.array(x.cpu().detach().numpy().astype(dtype), ctx)) for x in xs]
+        tvm_xs = [tvm.relay.const(tvm.nd.array(x.cpu().detach().numpy().astype(dtype), tvm_device)) for x in xs]
 
         #TODO: change execution model to Virtual Machine instead of interpreter by setting "kind='vm'"
-        result = tvm.relay.create_executor(mod=mod, ctx=ctx, target=target).evaluate(
+        result = tvm.relay.create_executor(mod=mod, device=tvm_device, target=target).evaluate(
                         expr=tvm.relay.Call(mod[fun], tvm_xs))
         # result = tvm.relay.create_executor(mod=mod, ctx=ctx, target=target).evaluate(
         #                 mod.get_global_var(fun))(tvm_xs)
@@ -121,10 +124,9 @@ def test_torch_fun_to_tvm(funName, dtype, device):
     try:
         print("generating inputs...")
         xs = generate_inputs_from_fun_sig(torchFunSig, dtype, device)
-        print("xs: ", xs)
     except Exception as e:
         print("[[ ERROR ]]: input generation failed for {}".format(funName))
-        print(str(e))
+        traceback.print_exc(file=sys.stdout)
         return (funName, 1, "input generation", str(e)), False
 
 
@@ -170,12 +172,22 @@ def test_torch_fun_to_tvm(funName, dtype, device):
     print("[[ SUCCESS ]]: '{}' (dtype={}, device={}) successfully passed the torch_to_tvm test".format(funName, dtype, device))
     return (funName, 6, "success"), True
 
-def tvm_compatible_torch_funs():
+def tvm_compatible_torch_funs(use_cached=True):
+    cache_filepath = 'autoduff/tvm_torch_funs.csv'
+    if use_cached and os.path.exists(cache_filepath):
+        with open(cache_filepath, 'r') as f:
+            return [tuple(line[:-1].split(',')) for line in f.readlines()]
+
     test = lambda fun_decl, dtype, device: test_torch_fun_to_tvm(fun_decl[0], dtype, device)
     blacklist = ['norm', 'pdist']
     filter_p = lambda fun_sig: fun_sig[0] not in blacklist and len(fun_sig[1].typs) == 2
     passes, fails = check_property_funs(test, filter_p) # Remember: .typs contains input type
     print("Testing finished.")
+
+    with open(cache_filepath, 'w') as f:
+        log.info("Reading function triples from file...")
+        f.writelines([','.join(p[1])+'\n' for p in passes])
+        log.info()
     return [p[1] for p in passes]
 
 
@@ -366,7 +378,8 @@ if __name__ == "__main__":
         print("Testing finished.")
         return passes, fails
 
-    passes, fails = view_torch_to_tvm_errors()
+    # passes, fails = view_torch_to_tvm_errors()
+    # tvm_compatible_torch_funs()
     # test_suite()
     # funs = tvm_compatible_torch_funs()
     # visualize_torch_vs_tvm(torch.sin, 'float32', 'cpu')

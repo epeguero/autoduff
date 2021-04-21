@@ -116,11 +116,13 @@ def gen_term_from_typ(typ, dtype, device):
         while found_nan:
             if typ == TensorTyp(typ=IntTyp(), shape=typ.shape):
                 generated_tensor = torch.rand(typ.shape, dtype=torch.int64).to(device)
+                # generated_tensor = torch.zeros(typ.shape, dtype=torch.int64).to(device)
             elif typ == TensorTyp(typ=NumTyp(), shape=typ.shape):
                 dtype_map = {'float16':torch.float16,
                           'float32':torch.float32,
                           'float64':torch.float64}
                 generated_tensor = torch.rand(typ.shape, dtype=dtype_map[dtype]).to(device)
+                # generated_tensor = torch.zeros(typ.shape, dtype=dtype_map[dtype]).to(device)
             elif typ == TensorTyp(typ=BoolTyp(), shape=typ.shape):
                 generated_tensor = (torch.rand(typ.shape) > 0.5).to(device)
             else:
@@ -506,7 +508,7 @@ pytorch_tensor_api = [
     # ('triu_indices', FunTyp(IntTyp(), IntTyp(), Tensor(typ=IntTyp()))) # output shape depends on inputs
     ('vander', FunTyp(TensorTyp(shape=(2,)), TensorTyp(shape=(2,2)))),
     ('view_as_real', FunTyp(TensorTyp(), TensorTyp())),
-    ('view_as_complex', FunTyp(TensorTyp(shape=(2,2)), TensorTyp(shape=(2,)))),
+    # ('view_as_complex', FunTyp(TensorTyp(shape=(2,2)), TensorTyp(shape=(2,)))),
 
     # BLAS and LAPACK Operations
     ('addbmm', FunTyp(TensorTyp(shape=(3,3)), TensorTyp(shape=(3,3,3)), TensorTyp(shape=(3,3,3)), TensorTyp(shape=(3,3)))),
@@ -745,7 +747,7 @@ if __name__ == "__main__":
         def test(fun_decl, _, __):
             fun_name = fun_decl[0]
             f = lookup_torch_func(fun_name)
-            return f, f is not None
+            return f, (f is not None)
         test_template('lookup by name', test)
 
     def input_generation_test():
@@ -756,6 +758,75 @@ if __name__ == "__main__":
             except Exception as e:
                 return e, False
         test_template('input generation', test)
+
+    # def wholistic_test():
+    #     def test(fun_decl, dtype, device):
+    #         funName = fun_decl[0]
+    #         print("Testing: '{}' (dtype={}, device={})".format(funName, dtype, device))
+    #
+    #         print("looking up '{}' in PyTorch by name...".format(funName))
+    #         torchFun = lookup_torch_func(funName)
+    #         torchFunSig = lookup_torch_fun_sig(funName)
+    #         if not torchFun:
+    #             print("[[ ERROR ]]: failed to look up '{}' in PyTorch".format(funName))
+    #             return (funName, 0, "could not look up in PyTorch", ""), False
+    #
+    #         xs = None
+    #         try:
+    #             print("generating inputs...")
+    #             xs = generate_inputs_from_fun_sig(torchFunSig, dtype, device)
+    #             # print("xs: ", xs)
+    #         except Exception as e:
+    #             print("[[ ERROR ]]: input generation failed for {}".format(funName))
+    #             traceback.print_exc(file=sys.stdout)
+    #             # if dtype != 'float16':
+    #             #     raise
+    #             return (funName, 1, "input generation", str(e)), False
+    #
+    #
+            # mod = None
+            # try:
+            #     print("converting to tvm module...")
+            #     mod = torch_to_tvm_mod(torch_module_patch(funName, torchFun), xs)
+            # except Exception as e:
+            #     print('[[ ERROR ]]: tvm function generation failed for {}'.format(funName))
+            #     print(e)
+            #     return (funName, 2, "missing op" if "operators are not implemented" in str(e) else "conversion failed", str(e)), False
+            #
+            # try:
+            #     print("generating gradient...")
+            #     mod = tvm_grad_gen(mod)
+            # except Exception as e:
+            #     print('[[ ERROR ]]: grad generation failed for {}'.format(funName))
+            #     print(e)
+            #     return (funName, 3, "missing grad" if "MissingGrad" in str(e) else "grad gen failed", str(e)), False
+            #
+            # try:
+            #     print("executing tvm-ified '{}'...".format(funName))
+            #     eval_tvm_mod_fun(mod, xs, dtype, device, 'main')
+            #
+            # except Exception as e:
+            #     print('[[ ERROR ]]: tvm-ified execution failed for "{}"'.format(funName))
+            #     print(e)
+            #     return (funName, 4, "tvm execution failed", str(e)), False
+            #
+            #
+            # try:
+            #     print("executing 1st/2nd gradients...")
+            #     eval_tvm_mod_fun(mod, xs, dtype, device, 'grad')
+            #     eval_tvm_mod_fun(mod, xs, dtype, device, 'grad2')
+            #
+            # except Exception as e:
+            #     print('[[ ERROR ]]: grad execution failed for {}'.format(funName))
+            #     print(e)
+            #     return (funName, 5, "missing op" if "The following operators are not implemented" in str(e) else
+            #                          "missing grad" if "MissingGrad" in str(e) else
+            #                          "grad eval failed", str(e)), False
+            #
+            # print("[[ SUCCESS ]]: '{}' (dtype={}, device={}) successfully passed the torch_to_tvm test".format(funName, dtype, device))
+            # return (funName, 6, "success"), True
+        # test_template('wholistic test', test)
+
 
     def test_suite():
         lookup_test()
