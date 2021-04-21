@@ -13,7 +13,6 @@ import math
 
 from collections import OrderedDict
 
-from loss import rel_err
 from torch_to_tvm import torch_to_tvm_mod, torch_to_tvm, torch_module_patch, eval_tvm_mod_fun, tvm_grad_gen, tvm_compatible_torch_funs
 from autoduff_utils import generate_inputs_from_fun_sig, lookup_torch_function, lookup_torch_func
 from autoduff_logging import log
