@@ -10,6 +10,7 @@ import copy
 from itertools import chain
 from functools import partial
 
+import concurrent.futures
 
 # constants
 all_dtypes = {  'float16':torch.float16,
@@ -734,6 +735,25 @@ def check_property_funs(p, filter_p=None):
 
     return passes, fails
 
+def check_property_funs_par(p, filter_p=None):
+    passes = []
+    fails = []
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        all_funs = pytorch_tensor_api if filter_p is None else filter_torch_by(filter_p)
+        jobs = []
+        for dtype in all_dtypes:
+            for device in all_devices:
+                for fun_decl in all_funs:
+                    print('starting future to check property for ({}, {}, {})...'.format(fun_decl[0], dtype, device))
+                    futures_dict = { executor.submit(p, fun_decl, dtype, device) : (fun_decl[0], dtype, device) }
+                    for completed_future in concurrent.futures.as_completed(futures_dict):
+                        fun_name, dtype, device = futures_dict[completed_future]
+                        out, passed = completed_future.result()
+                        print('future for ({}, {}, {}) completed.'.format(fun_name, dtype, device))
+                        dest = passes if passed else fails
+                        dest.append((out, (fun_decl[0], dtype, device)))
+
+    return passes, fails
 
 if __name__ == "__main__":
     def test_template(test_name, test):

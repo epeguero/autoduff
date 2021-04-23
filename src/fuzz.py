@@ -18,6 +18,8 @@ from autoduff_utils import generate_inputs_from_fun_sig, lookup_torch_function, 
 from autoduff_logging import log
 
 import concurrent.futures
+import time
+import os
 
 # n == 0: identity
 # n == 1: f(f(x))
@@ -42,17 +44,17 @@ def torch_funs(f_name):
 import bitstring
 binary = lambda x: bitstring.BitArray(float=x, length=32).bin
 
+LOSS_SCALING = 1e14
 def generate_loss_funs(torch_fun_name, dtype, device, compose=0):
-    scaling = 1e14
 
     def to_sum_of_entries(f):
         return lambda x: f(x).sum()
 
     def loss(f, g, x):
-        return abs(f(x) - g(x)) * scaling
+        return abs(f(x) - g(x)) * LOSS_SCALING
 
     def loss_grad(f, f_grad, g, g_grad, x):
-        return (scaling * ((f(x) - g(x)) * (f_grad(x) - g_grad(x)))) / (abs(f(x) - g(x)) * scaling) * scaling
+        return (LOSS_SCALING * ((f(x) - g(x)) * (f_grad(x) - g_grad(x)))) / (abs(f(x) - g(x)) * LOSS_SCALING) * LOSS_SCALING
 
     # def rel(a, b):
     #     return (a-b)/b
@@ -117,7 +119,7 @@ def fuzz_1param(loss, sgx_step, seed_input, loss_grad_fun, total_time=100, norma
     loss_vals = OrderedDict()
     for time in range(total_time):
         # log.info("iteration {}/{}".format(time, total_time))
-        loss_vals[time] = (x.clone().detach(), loss(x).clone().detach())
+        loss_vals[time] = (x.item(), loss(x).item())
 
         # log.info("x = {}".format(x))
         # log.info("loss = {}".format(loss_vals[time][1]))
@@ -194,32 +196,58 @@ def gradient_anomaly_detector_par(mode='sga', normalized=False, strict=False):
         # search_algo = lambda *fun: detect_grad_anomaly(*fun, mode=mode)
         # future_to_fun = {executor.submit(search_algo, *fun): fun for fun in tvm_compatible_torch_funs()}
         # TODO: get mode keyword to work!
-    with concurrent.futures.ProcessPoolExecutor(max_workers=6, mp_context=torch.multiprocessing.get_context('spawn')) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=12, mp_context=torch.multiprocessing.get_context('spawn')) as executor:
         future_to_fun = {executor.submit(detect_grad_anomaly, *fun, mode=mode): fun for fun in tvm_compatible_torch_funs() if fun[2] == 'cuda:0'}
         for future in concurrent.futures.as_completed(future_to_fun):
             fun = future_to_fun[future]
             try:
-                print('Collecting results with "{}" mode in: {} ({}, {})'.format(mode, *fun))
                 search_results = future.result()
-                if not strict:
-                    max_point = max([point for point in search_results.values()], key=lambda point: point[1])
-                    tuned_max_point = post_search_tuning(*fun, max_point[0])
-                    if tuned_max_point[1] > 0.:
-                        results[fun] = tuned_max_point
-                        print("max point: ", tuned_max_point)
+                log.info('Collected results for {}'.format(fun))
+                max_point = max([(x, loss/LOSS_SCALING) for (x,loss) in search_results.values()], key=lambda point: point[1])
+                if max_point[1] > 0.:
+                    results[fun] = max_point
+                    log.warning("anomalous point in {}: {}".format(fun, max_point))
+
+                # log.info('Tuning fuzzed point for {}'.format(fun))
+                # tuned_max_point = post_search_tuning(*fun, max_point[0])
+                # if tuned_max_point[1] > 0.:
+                #     results[fun] = tuned_max_point.to('cpu')
+                #     log.info("max point: ", tuned_max_point)
+                torch.cuda.empty_cache()
                 # TODO: implement strict sga. The priority here is to strictly use sga to find a maximum (as a means of measuring sga's effectiveness),
                 # rather than to find the maximum among all seen points
                 # if strict and mode=='sga_strict':
                 #     last_point = list(search_results.values(0))[-1]
 
-                print('[[FINISHED]]')
+                log.info('[[FINISHED]]: {}'.format(fun))
             except Exception as e:
                 print("Anomaly Detector Exception:\n{}".format(str(e)))
+                torch.cuda.empty()
+                # TODO: implement strict sga. The priority here is to strictly use sga to find a maximum (as a means of measuring sga's effectiveness),
                 raise
 
-    sorted_results = sorted(results.items(), key=lambda item: item[1][1])
+    sorted_results = sorted(results.items(), key=lambda item: item[1][1], reverse=True)
     print(sorted_results)
     return sorted_results
+
+def autoduff():
+    log.info("This is Autoduff.")
+    start_time = time.perf_counter()
+    write_results_to_file(gradient_anomaly_detector_par(mode='sga'))
+    end_time = time.perf_counter()
+    log.info(f"Autoduff completed execution in {end_time - start_time:0.4f} seconds.")
+
+
+def write_results_to_file(results):
+    results_dir = 'results'
+    # count preexisting results files
+    n = len([name for name in os.listdir(results_dir) if os.path.isfile(os.path.join(results_dir, name))])
+    results_filename = 'autoduff_results{}.csv'.format(n)
+    results_path = os.path.join(results_dir, results_filename)
+    log.info("Writing Autoduff results to '{}'".format(results_path))
+    with open(results_path, 'w') as f:
+        lines = ['{},{}\n'.format(fun, pt) for fun, pt in results]
+        f.writelines(list(map(str, results)))
 
 
 def post_search_tuning(funName, dtype, device, x_center):
@@ -245,35 +273,6 @@ def post_search_tuning(funName, dtype, device, x_center):
     max_point2 = max(zip(xs2, ys2), key=lambda point: point[1])
 
     return max_point2
-
-# def fuzz_asc(loss, seed_inputs, lossLang=ML.PyTorch, ascent=True, alpha=0.5, total_time=100):
-#     def chooseGrad():
-#         if gradLang == ML.PyTorch:
-#             return lambda xs: jacobian(loss, tuple(xs))
-#         elif gradLang == ML.TVM:
-#             loss_tvm, _ = torch_to_tvm(loss, seed_inputs)
-#             return lambda xs: tvmt.gradient(loss_tvm.entry_func)
-#     loss_grad = chooseGrad()
-#     grad_ascent = lambda time, x, grad: x + grad * alpha/(1 + time)
-#     return fuzz(loss, loss_grad, grad_ascent, seed_inputs, total_time)
-#
-#
-# def fuzz_desc(loss, loss_grad, seed_inputs, alpha=0.5, total_time=100):
-#     grad_descent = lambda time, x, grad: x - grad * alpha/(1 + time)
-#     return fuzz(loss, loss_grad, grad_descent, seed_inputs, total_time)
-
-
-# def write_to_file(test_results, filename):
-#     with open(filename, 'w') as f:
-#         top_axis = "".join(["{}.........".format(i) for i in range(10)]) * math.ceil(len(test_results.keys()) / 10.)
-#         f.write(top_axis + "\n")
-#         i = 0
-#         for test_fun1 in test_results.keys():
-#             for test_fun2 in test_results[test_fun1].keys():
-#                 fuzzed_input, result = test_results[test_fun1][test_fun2]
-#                 f.write(" " if result is None else "n" if math.isnan(result) else "." if math.isclose(result, 0.) else "F")
-#             f.write("\t{}. {}\n".format(i, test_fun1))
-#             i += 1
 
 
 if __name__ == "__main__":
@@ -492,6 +491,11 @@ if __name__ == "__main__":
             if max_y > 0.:
                 plot_loss(*fun, x_center=max_x)
 
+    def eval_loss_at_point(fun_name, dtype, device, point):
+        loss, _ = generate_loss_funs(fun_name, dtype, device, compose=0)
+        return loss(point) / LOSS_SCALING
+
+
     def test_suite():
         sin_derivative_test('float32', 'cpu')
         sin_derivative_test('float32', 'cuda:0')
@@ -506,6 +510,7 @@ if __name__ == "__main__":
         composed_sin_derivative_test('float32', 'cuda:0')
         # tvm_vs_torch_compose_sin(0, 'float32', 'cpu', torch.sin, torch.rand((2,2)))
 
+    autoduff()
     # test_suite()
     # plot_fuzz('reciprocal', 'float32', 'cpu')
     # plot_fuzz('reciprocal', 'float32', 'cuda:0')
@@ -521,5 +526,5 @@ if __name__ == "__main__":
     # plot_loss('reciprocal', 'float32', 'cpu')
     # compare_torch_tvm_fun('reciprocal', 'float32', 'cpu')
     # compare_torch_tvm_fun('tanhshrink', 'float32', 'cuda:0')
-    results = gradient_anomaly_detector_par()
+    # results = gradient_anomaly_detector_par()
     # analyze_search_results({('tan', 'float32', 'cpu') : {0 : (torch.tensor(-1.3110e15), torch.tensor(3.9063e11))}})
