@@ -66,35 +66,62 @@ def torch_to_tvm_mod(torch_fun, xs):
     # print("shape list", shape_list)
     mod, _ = relay.frontend.from_pytorch(torchscript, shape_list)
     mod = transform.Sequential([relay.transform.InferType()])(mod) # infer types, needed for execution and gradient
-    return mod
 
-
-def tvm_grad_gen(mod):
     grad = tvm.relay.transform.gradient(mod['main'], mod=mod)
-    mod['grad'] =   tvm.relay.Function(
-                        grad.params,
-                        tvm.relay.TupleGetItem(
+    mod_grad =  tvm.ir.IRModule.from_expr(
+                    tvm.relay.Function(
+                            grad.params,
                             tvm.relay.TupleGetItem(
-                                grad.body,
-                                1
-                            ), 0)
+                                tvm.relay.TupleGetItem(
+                                    grad.body,
+                                    1
+                                ), 0)
                     )
-    mod = transform.Sequential([relay.transform.InferType()])(mod)
+                )
+    mod_grad = transform.Sequential([relay.transform.InferType()])(mod)
 
-    grad2 = tvm.relay.transform.gradient(mod['grad'], mod=mod)
-    mod['grad2'] =  tvm.relay.Function(
-                        grad2.params,
-                        tvm.relay.TupleGetItem(
+    grad2 = tvm.relay.transform.gradient(mod_grad['main'], mod=mod)
+    mod_grad2 = tvm.ir.IRModule.from_expr(
+                        tvm.relay.Function(
+                            grad2.params,
                             tvm.relay.TupleGetItem(
-                                grad2.body,
-                                1
-                            ), 0)
-                    )
-    mod = transform.Sequential([relay.transform.InferType()])(mod)
-    return mod
+                                tvm.relay.TupleGetItem(
+                                    grad2.body,
+                                    1
+                                ), 0)
+                        )
+                 )
+    mod_grad2 = transform.Sequential([relay.transform.InferType()])(mod)
+
+    return mod, mod_grad, mod_grad2
 
 
-def eval_tvm_mod_fun(mod, xs, dtype='float32', device='cpu', fun='main'):
+# def tvm_grad_gen(mod):
+#     grad = tvm.relay.transform.gradient(mod['main'], mod=mod)
+#     mod['grad'] =   tvm.relay.Function(
+#                         grad.params,
+#                         tvm.relay.TupleGetItem(
+#                             tvm.relay.TupleGetItem(
+#                                 grad.body,
+#                                 1
+#                             ), 0)
+#                     )
+#     mod = transform.Sequential([relay.transform.InferType()])(mod)
+#
+#     grad2 = tvm.relay.transform.gradient(mod['grad'], mod=mod)
+#     mod['grad2'] =  tvm.relay.Function(
+#                         grad2.params,
+#                         tvm.relay.TupleGetItem(
+#                             tvm.relay.TupleGetItem(
+#                                 grad2.body,
+#                                 1
+#                             ), 0)
+#                     )
+#     mod = transform.Sequential([relay.transform.InferType()])(mod)
+#     return mod
+
+
+def eval_tvm_mod_fun(mod, xs, dtype='float32', device='cpu'):
     tvm_device = tvm.cpu() if device == 'cpu' else tvm.gpu()
     target = tvm.target.arm_cpu() if device == 'cpu' else tvm.target.cuda()
 
@@ -108,13 +135,14 @@ def eval_tvm_mod_fun(mod, xs, dtype='float32', device='cpu', fun='main'):
         tvm_xs = [tvm.relay.const(tvm.nd.array(x.cpu().detach().numpy().astype(dtype), tvm_device)) for x in xs]
 
         #TODO: change execution model to Virtual Machine instead of interpreter by setting "kind='vm'"
-        result = tvm.relay.create_executor(kind='vm', mod=mod, device=tvm_device, target=target).evaluate(
-                        expr=tvm.relay.Call(mod[fun], tvm_xs))
+        result = tvm.relay.create_executor(kind='vm', mod=mod, device=tvm_device, target=target).evaluate()(*[x.cpu().numpy() for x in xs])
+                        # expr=tvm.relay.Call(mod['main'], tvm_xs)
         # result = tvm.relay.create_executor(mod=mod, ctx=ctx, target=target).evaluate(
         #                 mod.get_global_var(fun))(tvm_xs)
         return torch.from_numpy(result.asnumpy()).to(device)
 
 
+# TODO: clean up returned errors
 def test_torch_fun_to_tvm(funDecl, dtype, device):
     funName = funDecl[0]
     print("Testing: '{}' (dtype={}, device={})".format(funName, dtype, device))
@@ -139,55 +167,55 @@ def test_torch_fun_to_tvm(funDecl, dtype, device):
 
     mod = None
     try:
-        print("converting to tvm module...")
-        mod = torch_to_tvm_mod(torch_module_patch(funName, torchFun), xs)
+        print("converting to tvm module and gradients...")
+        mod, mod_grad, mod_grad2 = torch_to_tvm_mod(torch_module_patch(funName, torchFun), xs)
     except Exception as e:
+        #TODO: debug 'object of type "NoneType" has no len()' error
         print('[[ ERROR ]]: tvm function generation failed for {}'.format(funName))
         print(e)
-        del mod
         del xs
         return (funName, 2, "missing op" if "operators are not implemented" in str(e) else "conversion failed", str(e)), False
 
-    try:
-        print("generating gradient...")
-        mod = tvm_grad_gen(mod)
-        print(mod['grad'])
-        raise
-    except Exception as e:
-        print('[[ ERROR ]]: grad generation failed for {}'.format(funName))
-        print(e)
-        del mod
-        del xs
-        return (funName, 3, "missing grad" if "MissingGrad" in str(e) else "grad gen failed", str(e)), False
+    # try:
+    #     print("generating gradient...")
+    #     mod = tvm_grad_gen(mod)
+    #     print(mod['grad'])
+    #     raise
+    # except Exception as e:
+    #     print('[[ ERROR ]]: grad generation failed for {}'.format(funName))
+    #     print(e)
+    #     del mod, mod_grad1, mod_grad2
+    #     del xs
+    #     return (funName, 3, "missing grad" if "MissingGrad" in str(e) else "grad gen failed", str(e)), False
 
     try:
         print("executing tvm-ified '{}'...".format(funName))
-        eval_tvm_mod_fun(mod, xs, dtype, device, 'main')
+        eval_tvm_mod_fun(mod, xs, dtype, device)
 
     except Exception as e:
         print('[[ ERROR ]]: tvm-ified execution failed for "{}"'.format(funName))
         print(e)
-        del mod
+        del mod, mod_grad, mod_grad2
         del xs
         return (funName, 4, "tvm execution failed", str(e)), False
 
 
     try:
         print("executing 1st/2nd gradients...")
-        eval_tvm_mod_fun(mod, xs, dtype, device, 'grad')
-        eval_tvm_mod_fun(mod, xs, dtype, device, 'grad2')
+        eval_tvm_mod_fun(mod_grad, xs, dtype, device)
+        eval_tvm_mod_fun(mod_grad2, xs, dtype, device)
 
     except Exception as e:
         print('[[ ERROR ]]: grad execution failed for {}'.format(funName))
         print(e)
-        del mod
+        del mod, mod_grad, mod_grad2
         del xs
         return (funName, 5, "missing op" if "The following operators are not implemented" in str(e) else
                              "missing grad" if "MissingGrad" in str(e) else
                              "grad eval failed", str(e)), False
 
     print("[[ SUCCESS ]]: '{}' (dtype={}, device={}) successfully passed the torch_to_tvm test".format(funName, dtype, device))
-    del mod
+    del mod, mod_grad, mod_grad2
     del xs
     torch.cuda.empty_cache()
     return (funName, 6, "success"), True
