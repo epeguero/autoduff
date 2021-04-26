@@ -10,12 +10,14 @@ from functools import reduce
 
 import operator
 import math
+from bitstring import BitArray
 
 from collections import OrderedDict
 
-from torch_to_tvm import torch_to_tvm_mod, torch_to_tvm, torch_module_patch, eval_tvm_mod_fun, tvm_grad_gen, tvm_compatible_torch_funs
+from torch_to_tvm import torch_to_tvm_mod, torch_to_tvm, torch_module_patch, eval_tvm_mod_fun, tvm_compatible_torch_funs
 from autoduff_utils import generate_inputs_from_fun_sig, lookup_torch_function, lookup_torch_func
 from autoduff_logging import log
+import autoduff_plot as ad_plt
 
 import concurrent.futures
 import time
@@ -41,8 +43,6 @@ def torch_funs(f_name):
     f_grad2_torch= lambda x: jacobian(f_grad_torch, x)
     return f_torch, f_grad_torch, f_grad2_torch
 
-import bitstring
-binary = lambda x: bitstring.BitArray(float=x, length=32).bin
 
 LOSS_SCALING = 1e14
 def generate_loss_funs(torch_fun_name, dtype, device, compose=0):
@@ -51,10 +51,10 @@ def generate_loss_funs(torch_fun_name, dtype, device, compose=0):
         return lambda x: f(x).sum()
 
     def loss(f, g, x):
-        return abs(f(x) - g(x)) * LOSS_SCALING
+        return abs(f(x) - g(x))
 
     def loss_grad(f, f_grad, g, g_grad, x):
-        return (LOSS_SCALING * ((f(x) - g(x)) * (f_grad(x) - g_grad(x)))) / (abs(f(x) - g(x)) * LOSS_SCALING) * LOSS_SCALING
+        return (LOSS_SCALING * ((f(x) - g(x)) * (f_grad(x) - g_grad(x)))) / (abs(f(x) - g(x)) * LOSS_SCALING)
 
     # def rel(a, b):
     #     return (a-b)/b
@@ -69,13 +69,12 @@ def generate_loss_funs(torch_fun_name, dtype, device, compose=0):
     _, torchFunSig, torch_fun = lookup_torch_function(torch_fun_name)
     torch_fun = self_compose(compose, torch_fun)
     x = generate_inputs_from_fun_sig(torchFunSig, dtype, device)[0] #assume arity one
-    tvm_mod = torch_to_tvm_mod(torch_module_patch(torch_fun_name, torch_fun), x)
-    tvm_mod = tvm_grad_gen(tvm_mod)
+    tvm_mod, tvm_mod_grad, tvm_mod_grad2 = torch_to_tvm_mod(torch_module_patch(torch_fun_name, torch_fun), x)
 
-    torch_grad = lambda x: jacobian(torch_fun, x, create_graph=True)
-    torch_grad2 = lambda x: jacobian(torch_grad, x)
-    tvm_grad = lambda x: eval_tvm_mod_fun(tvm_mod, [x], fun='grad', dtype=dtype, device=device)
-    tvm_grad2 = lambda x: eval_tvm_mod_fun(tvm_mod, [x], fun='grad2', dtype=dtype, device=device)
+    torch_grad = lambda x: jacobian(torch_fun, x.to(parse_torch_dtype(dtype)).to(device), create_graph=True)
+    torch_grad2 = lambda x: jacobian(torch_grad, x.to(parse_torch_dtype(dtype)).to(device))
+    tvm_grad = lambda x: eval_tvm_mod_fun(tvm_mod_grad, [x], dtype=dtype, device=device)
+    tvm_grad2 = lambda x: eval_tvm_mod_fun(tvm_mod_grad2, [x], dtype=dtype, device=device)
 
     torch_grad, torch_grad2, tvm_grad, tvm_grad2 = \
         list(map(to_sum_of_entries, [torch_grad, torch_grad2, tvm_grad, tvm_grad2]))
@@ -86,61 +85,147 @@ def generate_loss_funs(torch_fun_name, dtype, device, compose=0):
 
 # loss :: Tensor -> Tensor
 # seed :: tuple Tensor   NOTE: Must be Tuple!
-def fuzz(loss, sgx_step, seed_inputs, loss_grad_fun = None, total_time=100):
-    assert (type(seed_inputs) in [tuple, list]), "fuzzer expects tuple type of seed inputs; found {}".format(type(seed_inputs))
-    loss_grads = (lambda xs: jacobian(loss, tuple(xs))) if loss_grad_fun is None else loss_grad_fun
-    original_dtypes = [x.dtype for x in seed_inputs]
-    downcast = lambda xs: [x.to(dtype) for x, dtype in zip(xs, original_dtypes)]
+# def fuzz(loss, sgx_step, seed_inputs, loss_grad_fun = None, total_time=100):
+#     assert (type(seed_inputs) in [tuple, list]), "fuzzer expects tuple type of seed inputs; found {}".format(type(seed_inputs))
+#     loss_grads = (lambda xs: jacobian(loss, tuple(xs))) if loss_grad_fun is None else loss_grad_fun
+#     original_dtypes = [x.dtype for x in seed_inputs]
+#     downcast = lambda xs: [x.to(dtype) for x, dtype in zip(xs, original_dtypes)]
+#
+#     xs = seed_inputs
+#     loss_vals = OrderedDict()
+#     for time in range(total_time):
+#         log.info("iteration {}/{}".format(time, total_time))
+#         loss_vals[time] = loss(xs)
+#
+#         log.info("loss = {}".format(loss_vals[time]))
+#         with torch.no_grad():
+#             print(xs)
+#             next_xs = [sgx_step(time, x.to(torch.float64), grad.to(torch.float64)) for x, grad in zip(xs, loss_grads(xs))]
+#             xs = downcast(next_xs)
+#
+#         if any(map(lambda t:torch.isnan(t).any(), xs)):
+#             raise Exception("fuzzer encountered NaN value at iteration {}".format(time))
+#
+#     return xs, loss_vals
+#
 
-    xs = seed_inputs
-    loss_vals = OrderedDict()
-    for time in range(total_time):
-        log.info("iteration {}/{}".format(time, total_time))
-        loss_vals[time] = loss(xs)
+def nearest_float(x, direction, dtype):
+    if dtype == 'float16':
+        return nearest_half_prec_float(x, direction)
 
-        log.info("loss = {}".format(loss_vals[time]))
-        with torch.no_grad():
-            print(xs)
-            next_xs = [sgx_step(time, x.to(torch.float64), grad.to(torch.float64)) for x, grad in zip(xs, loss_grads(xs))]
-            xs = downcast(next_xs)
+    length = int(str(dtype)[-2:])
+    # print('length ', length)
 
-        if any(map(lambda t:torch.isnan(t).any(), xs)):
-            raise Exception("fuzzer encountered NaN value at iteration {}".format(time))
+    bs = BitArray(float=x.item(), length=length).bin
+    # print('bs', bs)
 
-    return xs, loss_vals
+    int_rep = int(bs, 2)
+    # print('int_rep ', int_rep)
+
+    nearest_int_rep = int_rep + (1 if direction > 0 else -1)
+    # print('nearest_int_rep ', nearest_int_rep)
+
+    nearest_bs = bin(nearest_int_rep)[2:].zfill(length)
+    # print('nearest_bs ', nearest_bs)
+
+    nearest = BitArray(bin=nearest_bs).float
+    # print('x={:20}'.format(x))
+    # print('nearest={:20}'.format(nearest))
+
+    return torch.tensor(nearest)
 
 
-def fuzz_1param(loss, sgx_step, seed_input, loss_grad_fun, total_time=100, normalized=False):
-    assert (type(seed_input) in [torch.Tensor]), "1 param fuzzer expects seed input of Tensor type; found {}".format(type(seed_input))
+
+def nearest_half_prec_float(x, direction):
+    assert direction != 0, 'expected non-zero direction'
+
+    def str_to_float16(bs):
+        sign_str, e_str, m_str = bs[0], bs[1:6], bs[6:]
+        sign = 1 if int(sign_str) == 0 else -1
+        # accomodate subnormal numbers by checking 0 exponent string
+        unbiased_e = int(e_str, 2)
+        e = unbiased_e - 15 if unbiased_e != 0 else -14
+        m = sum([int(m_str[i]) * 2**(-i-1) for i in range(len(m_str))]) + (1 if unbiased_e != 0 else 0)
+        return sign * m * 2**e
+
+    bs = bin(np.float16(x).view('H'))[2:].zfill(16)
+    nearest_int_rep = int(bs,2) + (1 if direction > 0. else -1)
+    nearest_bs = bin(nearest_int_rep)[2:].zfill(16)
+
+    return torch.tensor(str_to_float16(nearest_bs))
+
+
+def fuzz_1param(loss, loss_grad, seed_input, alpha=0.4, total_time=100):
+    assert (type(seed_input) in [torch.Tensor]), "fuzzer expects seed input of Tensor type; found {}".format(type(seed_input))
     original_dtype = seed_input.dtype
-    downcast = lambda x: x.to(original_dtype)
+    sga_step = lambda alpha, time, x, grad: (x.to(torch.float64) + alpha / (time+1) * grad.to(torch.float64)).to(original_dtype)
+
+    def fuzz_post_condition(fuzz_out):
+        assert list(fuzz_out.values()) == sorted(list(fuzz_out.values()), key=lambda item:item[1]), "fuzzing was non-monotonic!"
 
     x = seed_input
-    loss_vals = OrderedDict()
+    fuzz = OrderedDict()
     for time in range(total_time):
-        # log.info("iteration {}/{}".format(time, total_time))
-        loss_vals[time] = (x.item(), loss(x).item())
-
-        # log.info("x = {}".format(x))
-        # log.info("loss = {}".format(loss_vals[time][1]))
         with torch.no_grad():
-            # log.info('gradient: {}'.format(binary(np.float32(loss_grad_fun(x).item()))))
-            # log.info('gradient: {}'.format(loss_grad_fun(x).item()))
-            next_x = sgx_step(time, x.to(torch.float64), loss_grad_fun(x).to(torch.float64))
-            x = downcast(next_x)
+            log.info("iteration {}/{}".format(time, total_time))
+            fuzz[time] = (x.item(), loss(x).item())
 
-            if torch.isnan(x).sum() > 0:
-                log.info("[[ NaN ]]: Ending fuzz at iteration {}".format(time))
-                return loss_vals
+            log.info("(x, loss) = {}".format(fuzz[time]))
+            grad = loss_grad(x)
+            log.info("loss grad = {}".format(grad))
 
-            # end normalized sga search if we escape [0, 1)
-            # We could continue with a random seed, but then fuzzing can devolve into random search
-            # This is not necessarily bad, but we avoid that to distinguish performance of sga from random search
-            if normalized and (x < 0. or x >= 1.):
-                # x = torch.rand(x.shape, dtype=x.dtype, device=x.device)
-                return loss_vals
+            next_x = sga_step(alpha, time, x, grad)
+            log.info("X DELTA: {:5} - {:5} = {:10g}".format(next_x, x, next_x-x))
 
-    return loss_vals
+            next_loss = loss(next_x).item()
+            curr_loss = fuzz[time][1]
+            loss_delta = next_loss - curr_loss
+            log.info("LOSS DELTA: {:3} - {:3} = {:10g}".format(next_loss, curr_loss, next_loss - curr_loss))
+
+            if next_loss > curr_loss:
+                assert x != next_x, "zero change in x increased loss??!? x={}, next_x={}".format(x.item(), next_x.item())
+                log.critical("[[ FUZZING X ]]: positive loss with x delta = {}".format(next_x - x))
+                x = next_x
+
+            else:
+                # check if gradient is non-zero but too small relative to size of x
+                # in this case, we check the closest float in the gradient direction for loss increase
+                # RATIONALE: small gradient could slowly diminish over a long interval
+                if next_x == x and grad != 0:
+                    near_x = nearest_float(x, grad, original_dtype)
+                    near_loss_delta = loss(near_x).item() - fuzz[time][1]
+                    if near_loss_delta > 0.:
+                        log.info("[[ FUZZING x ]]: positive loss at nearest float")
+                        x = near_x
+                    else:
+                        log.info("[[ FINISHED ]]: non-positive change in loss (LOSS_DELTA={}), even at nearest float in grad direction, ({})".format(near_loss_delta, near_x))
+                        fuzz_post_condition(fuzz)
+                        return fuzz
+
+                elif grad == 0:
+                    log.info("[[ FINISHED ]]: local maxima found")
+                    fuzz_post_condition(fuzz)
+                    return fuzz
+
+                else: # x_delta != 0.
+                    log.info("[[ DECREASING ALPHA ]]: since next step would yield non-positive loss, assume step went too far.")
+                    alpha = alpha / 2.
+
+                # elif torch.isnan(next_x).sum() > 0:
+                #     log.info("[[ NaN ]]: Ending fuzz at iteration {}".format(time))
+                #     return loss_vals
+
+    return fuzz
+
+
+def uniform_sample_float(normalized=False):
+    if normalized:
+        return torch.rand([])
+    significand = torch.rand([])
+    exponent = (torch.rand([]) * 255 - 127).to(torch.int) #TODO: generalize for dtypes
+    sample = significand * (2. ** exponent)
+    assert sample != math.inf, 'sampled "inf" value'
+    return sample
 
 
 def random_search(loss, dtype, device, n=100, normalized=True):
@@ -160,36 +245,49 @@ def random_search(loss, dtype, device, n=100, normalized=True):
 #
 # SGA steps in the direction of greatest ascent of L(x), ie, its gradient:
 # SGA(time, x) = x  +  alpha * dL(x)/dx / time
-def detect_grad_anomaly(torchFunName, dtype, device, mode='sga', normalized=False):
+def detect_grad_anomaly(torchFunName, dtype, device, seed_input=None, mode='sga', normalized=False):
     if 'sga' in mode:
         loss_fun, loss_grad_fun = generate_loss_funs(torchFunName, dtype, device)
-        alpha = 1.2
-        sga_step = lambda time, x, grad: x + grad
-        _, torchFunSig, torch_fun = lookup_torch_function(torchFunName)
-        seed_inputs = generate_inputs_from_fun_sig(torchFunSig, dtype, device)
-        return fuzz_1param(loss_fun, sga_step, seed_inputs[0], loss_grad_fun, total_time=100)
+        test=torch.tensor(0.8298882842063904)
+        print(loss_fun(test))
+        print(loss_fun(test))
+        print(loss_fun(test))
+
+        if not seed_input:
+            log.info("generating seed input with non-zero gradient")
+            start = None
+            for i in range(100):
+                sample = uniform_sample_float()
+                grad = loss_grad(sample)
+                if grad != 0.:
+                   log.critical("[[ FOUND GOOD SEED! ]]: attempt {} produced: {}".format(i, sample, grad))
+                   seed_input = sample
+                   break
+
+        return fuzz_1param(loss_fun, loss_grad_fun, seed_input, total_time=100)
     elif mode == 'random':
         return random_search(loss_fun, dtype, device)
     else:
         raise Exception("unimplemented grad anomaly search mode '{}'".format(mode))
 
 
-def gradient_anomaly_detector():
-    results = []
-    for (f, dtype, device) in tvm_compatible_torch_funs():
-        try:
-            loss_vals = detect_grad_anomaly(f, dtype, device)
-            worst_loss = max([(_, loss_val) for (_, loss_val) in loss_vals.values()])
-            results.append(((f, dtype, device), worst_loss))
-        except Exception as e:
-            print("Anomaly Detector Exception:\n{}".format(str(e)))
-    results.sort(key = lambda x: x[1], reverse=True)
-    print("\n".join(list(map(lambda x: str(x), results))))
-    return results
+# def gradient_anomaly_detector():
+#     results = []
+#     for (f, dtype, device) in tvm_compatible_torch_funs():
+#         try:
+#             loss_vals = detect_grad_anomaly(f, dtype, device)
+#             worst_loss = max([(_, loss_val) for (_, loss_val) in loss_vals.values()])
+#             results.append(((f, dtype, device), worst_loss))
+#         except Exception as e:
+#             print("Anomaly Detector Exception:\n{}".format(str(e)))
+#     results.sort(key = lambda x: x[1], reverse=True)
+#     print("\n".join(list(map(lambda x: str(x), results))))
+#     return results
 
 
 
-def gradient_anomaly_detector_par(mode='sga', normalized=False, strict=False):
+# funs is a list of triples :: (funName, dtype, device)
+def gradient_anomaly_detector_par(funs, mode='sga', normalized=False, strict=False):
     results = {}
     # executor = concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=torch.multiprocessing.get_context('spawn'))
     # with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -197,13 +295,13 @@ def gradient_anomaly_detector_par(mode='sga', normalized=False, strict=False):
         # future_to_fun = {executor.submit(search_algo, *fun): fun for fun in tvm_compatible_torch_funs()}
         # TODO: get mode keyword to work!
     with concurrent.futures.ProcessPoolExecutor(max_workers=12, mp_context=torch.multiprocessing.get_context('spawn')) as executor:
-        future_to_fun = {executor.submit(detect_grad_anomaly, *fun, mode=mode): fun for fun in tvm_compatible_torch_funs() if fun[2] == 'cuda:0'}
+        future_to_fun = {executor.submit(detect_grad_anomaly, *fun, mode=mode): fun for fun in funs if fun[2] == 'cuda:0'}
         for future in concurrent.futures.as_completed(future_to_fun):
             fun = future_to_fun[future]
             try:
                 search_results = future.result()
                 log.info('Collected results for {}'.format(fun))
-                max_point = max([(x, loss/LOSS_SCALING) for (x,loss) in search_results.values()], key=lambda point: point[1])
+                max_point = max([(x, loss) for (x,loss) in search_results.values()], key=lambda point: point[1])
                 if max_point[1] > 0.:
                     results[fun] = max_point
                     log.warning("anomalous point in {}: {}".format(fun, max_point))
@@ -230,15 +328,24 @@ def gradient_anomaly_detector_par(mode='sga', normalized=False, strict=False):
     print(sorted_results)
     return sorted_results
 
-def autoduff():
+def autoduff(use_cached=True):
     log.info("This is Autoduff.")
     start_time = time.perf_counter()
-    write_results_to_file(gradient_anomaly_detector_par(mode='sga'))
+
+    log.info("1. Determining functions to test...")
+    funs_under_test = tvm_compatible_torch_funs(use_cached)
+    log.info("2. Fuzzing '{}' functions in search for anomalies".format(len(funs_under_test)))
+    anomalies = gradient_anomaly_detector_par(funs_under_test)
+    log.info("3. Writing found anomalies to file")
+    write_anomalies_to_file(anomalies)
+
     end_time = time.perf_counter()
     log.info(f"Autoduff completed execution in {end_time - start_time:0.4f} seconds.")
 
 
-def write_results_to_file(results):
+def write_anomalies_to_file(results):
+    if not results:
+        return
     results_dir = 'results'
     # count preexisting results files
     n = len([name for name in os.listdir(results_dir) if os.path.isfile(os.path.join(results_dir, name))])
@@ -493,7 +600,7 @@ if __name__ == "__main__":
 
     def eval_loss_at_point(fun_name, dtype, device, point):
         loss, _ = generate_loss_funs(fun_name, dtype, device, compose=0)
-        return loss(point) / LOSS_SCALING
+        return loss(point)
 
 
     def test_suite():
@@ -510,7 +617,11 @@ if __name__ == "__main__":
         composed_sin_derivative_test('float32', 'cuda:0')
         # tvm_vs_torch_compose_sin(0, 'float32', 'cpu', torch.sin, torch.rand((2,2)))
 
-    autoduff()
+    detect_grad_anomaly('sin', 'float32', 'cpu', seed_input=torch.tensor(0.6030315160751343))
+    # ad_plt.plot_finish(name='fuzz', save=True, show=False)
+    # nearest_float(2.1118e24, 1, 'float32')
+
+    # autoduff(use_cached=False)
     # test_suite()
     # plot_fuzz('reciprocal', 'float32', 'cpu')
     # plot_fuzz('reciprocal', 'float32', 'cuda:0')
