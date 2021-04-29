@@ -23,6 +23,9 @@ def get_logger():
 def enable_logger_debug():
     log.setLevel(logging.DEBUG)
 
+def disable_most_logging(log):
+    log.setLevel(logging.CRITICAL)
+
 log = get_logger()
 
 # class TestSetupError(Exception):

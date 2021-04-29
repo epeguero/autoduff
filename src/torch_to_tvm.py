@@ -48,12 +48,11 @@ def torch_module_patch(modelName, model):
 def torch_to_tvm(torch_fun_name, dtype, device):
     _, torchFunSig, f_torch = lookup_torch_function(torch_fun_name)
     trace_x = generate_inputs_from_fun_sig(torchFunSig, dtype, device)[0] #assume arity one
-    tvm_mod = torch_to_tvm_mod(torch_module_patch(torch_fun_name, f_torch), trace_x)
-    tvm_mod = tvm_grad_gen(tvm_mod)
+    tvm_mod, tvm_mod_grad, tvm_mod_grad2 = torch_to_tvm_mod(torch_module_patch(torch_fun_name, f_torch), trace_x)
 
-    f_tvm = lambda x: eval_tvm_mod_fun(tvm_mod, [x], fun='main', dtype=dtype, device=device)
-    f_tvm_grad = lambda x: eval_tvm_mod_fun(tvm_mod, [x], fun='grad', dtype=dtype, device=device)
-    f_tvm_grad2 = lambda x: eval_tvm_mod_fun(tvm_mod, [x], fun='grad2', dtype=dtype, device=device)
+    f_tvm = lambda x: eval_tvm_mod_fun(tvm_mod, [x], dtype=dtype, device=device)
+    f_tvm_grad = lambda x: eval_tvm_mod_fun(tvm_mod_grad, [x], dtype=dtype, device=device)
+    f_tvm_grad2 = lambda x: eval_tvm_mod_fun(tvm_mod_grad2, [x], dtype=dtype, device=device)
     return f_tvm, f_tvm_grad, f_tvm_grad2
 
 
@@ -132,10 +131,10 @@ def eval_tvm_mod_fun(mod, xs, dtype='float32', device='cpu'):
     with tvm.transform.PassContext(opt_level=3, disabled_pass=["FoldScaleAxis"]):
         # Only CPU tensor can be converted to numpy
         # This is fine even for GPU, since the tvm evaluator will target the device parameter
-        tvm_xs = [tvm.relay.const(tvm.nd.array(x.cpu().detach().numpy().astype(dtype), tvm_device)) for x in xs]
+        # tvm_xs = [tvm.relay.const(tvm.nd.array(x.cpu().detach().numpy().astype(dtype), tvm_device)) for x in xs]
 
         #TODO: change execution model to Virtual Machine instead of interpreter by setting "kind='vm'"
-        result = tvm.relay.create_executor(kind='vm', mod=mod, device=tvm_device, target=target).evaluate()(*[x.cpu().numpy() for x in xs])
+        result = tvm.relay.create_executor(kind='vm', mod=mod, device=tvm_device, target=target).evaluate()(*[x.cpu().detach().numpy() for x in xs])
                         # expr=tvm.relay.Call(mod['main'], tvm_xs)
         # result = tvm.relay.create_executor(mod=mod, ctx=ctx, target=target).evaluate(
         #                 mod.get_global_var(fun))(tvm_xs)

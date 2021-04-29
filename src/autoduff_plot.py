@@ -1,6 +1,12 @@
 import matplotlib
 import matplotlib.pyplot as plt
 
+def compute_points(f, x_center, n):
+    xs = [float(x) for x in range(int(x_center - n/2), int(x_center + n/2))]
+    ys = [f(torch.tensor(x)).item() for x in xs]
+    assert len(xs) >= n-2
+    return xs, ys
+
 def plot_function(f, color='b', linestyle="solid", x_center=0., n=20, ax=None):
     xs, ys = compute_points(f, x_center, n)
     min_x, max_x = min(xs), max(xs)
@@ -25,9 +31,9 @@ def plot_torch_vs_tvm(fun_name, dtype, device, x_center=0.):
     plt(tvm_f, 'g', x_center=x_center)
     plt(lambda x: f(x) - tvm_f(x), 'b', x_center=x_center)
 
-def plot_dict(d, color='b', ax=None):
+def plot_points(xs, ys, color='b', ax=None):
     graph = plt if ax is None else ax
-    graph.scatter(list(d.keys()), list(d.values()), color=color)
+    graph.scatter(xs, ys, color=color)
 
 def plot_finish(name=None, save=False, show=True):
     if save:
