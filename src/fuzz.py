@@ -27,6 +27,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 
+import pickle
 # n == 0: identity
 # n == 1: f(f(x))
 # ...
@@ -70,12 +71,14 @@ def generate_loss_funs(torch_fun_name, dtype, device, anomaly_type, loss_type):
     #     return (a-b)/b
     #
     def loss_rel(f, g, x):
-        return abs(f(x) - g(x)) / g(x)
+        return ((f(x) - g(x)) / g(x)) ** 2
+        # return abs(f(x) - g(x)) / g(x)
 
     def loss_rel_grad(f, f_grad, g, g_grad, x):
-        # return 2 * (f(x) - g(x)) * (g(x) * f_grad(x) - f(x) * g_grad(x)) / g(x)**3
-        diff = f(x) - g(x)
-        return diff * (f_grad(x) - g_grad(x)) / (g(x)**2 * abs(diff)) - (2*g_grad(x) * abs(diff)) / g_grad(x)**3
+        return 2 * (f(x) - g(x)) * (g(x) * f_grad(x) - f(x) * g_grad(x)) / (g(x) ** 3)
+        # return 2 * (f(x) - g(x)) * (g(x) * f_grad(x) - f(x) * g_grad(x)) / g(x) / g(x) / g(x)
+        # diff = f(x) - g(x)
+        # return diff * (f_grad(x) - g_grad(x)) / (g(x)**2 * abs(diff)) - (2*g_grad(x) * abs(diff)) / g_grad(x)**3
 
     f_torch, f_grad_torch, f_grad2_torch = torch_funs(torch_fun_name)
     f_tvm, f_grad_tvm, f_grad2_tvm = torch_to_tvm(torch_fun_name, dtype, device)
@@ -175,10 +178,13 @@ def fuzz_1param(loss, loss_grad, seed_input, normalized, alpha=0.4, total_iters=
 
         if grad in [math.nan, math.inf]:
             log.error("[[ FINISHED ]]: Grad was NaN or inf")
+            break
 
         next_x = sga_step(alpha, i, x, grad).to(original_dtype).to(original_device)
         if normalized and next_x < 0. or next_x > 1.:
             log.info("[[ DECREASING ALPHA ]]: fuzzer running in normalized mode stepped outside of [0,1]")
+            alpha = alpha / 10.
+            continue
 
         delta_x = next_x - x
         log.info("X DELTA: {:5} - {:5} = {:10g}".format(next_x, x, delta_x))
@@ -189,7 +195,11 @@ def fuzz_1param(loss, loss_grad, seed_input, normalized, alpha=0.4, total_iters=
         loss_delta = next_loss - curr_loss
         log.info("LOSS DELTA: {:3} - {:3} = {:10g}".format(next_loss, curr_loss, loss_delta))
 
-        if next_loss > curr_loss:
+        if next_loss in [math.nan, math.inf]:
+            log.info("[[ DECREASING ALPHA ]]: since next step would yield NaN or inf")
+            alpha = alpha / 10.
+
+        elif next_loss > curr_loss:
             assert x != next_x, "zero change in x increased loss??!? x={}, next_x={}".format(x.item(), next_x.item())
             loss_perc_inc = (next_loss/curr_loss - 1) * 100
             log.critical("[[ FUZZING X ]]: positive loss (LOSS_DELTA={}, {:3g}% increase) with x delta = {}".format(next_loss-curr_loss, loss_perc_inc, delta_x))
@@ -234,16 +244,17 @@ def uniform_sample_float(normalized, dtype, device):
         return torch.rand([], dtype=dtype, device=device)
         # exponent = (torch.rand([]) * -20).to(torch.int)
         # return torch.rand([]) * (2.** exponent)
-    significand = torch.rand([], dtype=dtype, device=device)
-    max_exp, exp_bias = {torch.float16: (31, 15), torch.float32: (255, 127), torch.float64: (2047, 1023)}[dtype]
-    exponent = (torch.rand([], device=device) * max_exp).to(torch.int) - exp_bias
+    # max_exp, exp_bias = {torch.float16: (31, 15), torch.float32: (255, 127), torch.float64: (2047, 1023)}[dtype]
+    min_exp, max_exp = {torch.float16: (-14, 15), torch.float32: (-126, 127), torch.float64: (-126, 127)}[dtype]#(-16382, 16383)}[dtype]
+    exponent = ((torch.rand([], device=device) * (max_exp-min_exp)).to(torch.int) + min_exp).to(dtype)
+    significand = torch.rand([], dtype=dtype, device=device) + torch.tensor(0. if exponent == max_exp else 1., dtype=dtype, device=device)
     sample = (significand * (2. ** exponent)).to(dtype).to(device)
     assert sample != math.inf, 'sampled "inf" value'
     assert sample != math.nan, 'sampled "nan" value'
     return sample
 
 
-def random_search(loss, dtype, device, n=300, normalized=False, timeout=120):
+def random_search(loss, dtype, device, normalized, timeout):
     torch_dtype = parse_torch_dtype(dtype)
     loss_vals = OrderedDict()
     start_time = time.perf_counter()
@@ -276,19 +287,22 @@ def random_search_large_loss_grad(dtype, device, loss_grad, normalized, timeout)
 #
 # SGA steps in the direction of greatest ascent of L(x), ie, its gradient:
 # SGA(time, x) = x  +  alpha * dL(x)/dx / time
-def detect_grad_anomaly(torchFunName, dtype, device, anomaly_type, loss_type, mode, normalized, total_time=100, seed_input=None, seed_timeout=30, random_timeout=120):
+def detect_grad_anomaly(torchFunName, dtype, device, anomaly_type, loss_type, mode, normalized, total_time=100, seed_input=None, sga_timeout=60, random_timeout=60):
+    log.info(f'Detecting anomalies in ({torchFunName}, {dtype}, {device})')
+    log.info(f'Anomaly detection parameters: anomaly_type={anomaly_type}, mode={mode}, normalized={normalized}')
     loss, loss_grad = generate_loss_funs(torchFunName, dtype, device, anomaly_type, loss_type)
     if 'sga' in mode:
         if not seed_input:
+            seed_timeout = sga_timeout / 2.
             log.info("randomly searching for good seed input for {} seconds (hoping for one with large loss gradient)".format(seed_timeout))
             sample, sample_loss_grad = random_search_large_loss_grad(dtype, device, loss_grad, normalized, seed_timeout)
             if sample_loss_grad.isinf().item() or sample_loss_grad.isnan().item() or sample_loss_grad.item() == 0.:
                 log.info("[[ STOPPING ]]: either the provided or generated seed has bad loss gradient (0, inf, or NaN). Terminating.")
                 return OrderedDict()
             seed_input = sample
-        return fuzz_1param(loss, loss_grad, seed_input, normalized, total_iters=total_time, timeout=90)
+        return fuzz_1param(loss, loss_grad, seed_input, normalized, total_iters=total_time, timeout=sga_timeout/2)
     elif mode == 'random':
-        return random_search(loss, dtype, device, normalized=normalized, timeout=random_timeout)
+        return random_search(loss, dtype, device, normalized, random_timeout)
     else:
         raise Exception("unimplemented grad anomaly search mode '{}'".format(mode))
 
@@ -335,27 +349,91 @@ def autoduff(anomaly_type, loss_type, mode, normalized, use_cached=True):
     end_time = time.perf_counter()
     log.critical(f"Autoduff completed execution in {end_time - start_time:0.4f} seconds.")
 
+results_dir = 'results'
 def write_anomalies_to_file(results, anomaly_type, loss_type, mode, normalized):
     if not results:
         return
-    results_dir = 'results'
     # count preexisting results files
     n = len([name for name in os.listdir(results_dir) if os.path.isfile(os.path.join(results_dir, name))])
     results_filename = '{}_{}_{}_{}_{}.txt'.format(anomaly_type, loss_type, mode, normalized, n)
     results_path = os.path.join(results_dir, results_filename)
     log.critical("Writing Autoduff results to '{}'".format(results_path))
-    with open(results_path, 'w') as f:
-        lines = ['{},{}\n'.format(fun, pt) for fun, pt in results]
-        f.writelines(list(map(str, results)))
+    with open(results_path, 'wb') as f:
+        pickle.dump( results, f)
+        # lines = ['{},{}\n'.format(fun, pt) for fun, pt in results]
+        # f.writelines(list(map(str, results)))
 
-def test_autoduff(anomaly_types=anomaly_types, modes=modes, normalized_modes=[True, False]):
+def read_results_from_file_with_suffix(n):
+    def read_number_in_string(string):
+        return int(''.join([c for c in string if c.isdigit()]))
+    matching_files = [filename for filename in os.listdir(results_dir) if filename != '' and read_number_in_string(filename) == n]
+    assert len(matching_files) == 1, 'multiple matches; results would be ambiguous'
+    filename = matching_files[0]
+    filename_minus_ext = filename.split('.')[0]
+    anomaly_type, _, mode, normalize_str, n_str = filename_minus_ext.split('_')
+    assert n == int(n_str), f'expected {n} at the end of the filename'
+    print(f'unpickling results in file "{filename}"')
+    return anomaly_type, mode, bool(normalize_str), pickle.load( open(os.path.join(results_dir, filename), 'rb') )
+
+def analyze_results(n):
+    anomaly_type, _, _, results = read_results_from_file_with_suffix(n)
+    results = list(filter(lambda item: item[1][1] not in [math.nan, math.inf], results))
+    extended_results = []
+    for (fun, anom) in results:
+        _, dtype, device = fun
+        abs_err, _ = generate_loss_funs(*fun, anomaly_type, 'abs')
+        abs_err_val = abs_err(torch.tensor(anom[0], dtype=parse_torch_dtype(dtype), device=device)).item()
+        extended_results.append((fun, anom, abs_err_val))
+
+    num_anomalies = len(results)
+
+    print(f'analyzing file with #{n}:...')
+    print(f'# of anomalies found: {num_anomalies}')
+
+    (largest_abs_fun, (largest_abs_x, largest_abs_rel), largest_abs) = max(extended_results, key=lambda item: item[2])
+    print(f'largest anomaly absolute error found: fun = {largest_abs_fun}; {largest_abs} @ {largest_abs_x}; rel_err = {math.sqrt(largest_abs_rel)}')
+
+    (smallest_abs_fun, (smallest_abs_x, smallest_abs_rel), smallest_abs) = min(extended_results, key=lambda item: item[2])
+    print(f'smallest anomaly absolute error found: fun = {smallest_abs_fun}; {smallest_abs} @ {smallest_abs_x}; rel_err = {math.sqrt(smallest_abs_rel)}')
+
+    print(f'average anomaly absolute error found: {sum([item[2] for item in extended_results]) / num_anomalies}')
+
+    (largest_rel_fun, (largest_rel_x, largest_rel), largest_rel_abs) = max(extended_results, key=lambda item: item[1][1])
+    print(f'largest anomaly relative error found: fun = {largest_rel_fun}; {math.sqrt(largest_rel)} @ {largest_rel_x}; abs_err = {largest_rel_abs}')
+
+    (smallest_rel_fun, (smallest_rel_x, smallest_rel), smallest_rel_abs) = min(extended_results, key=lambda item: item[1][1])
+    print(f'smallest anomaly relative error found: fun = {smallest_rel_fun}; {math.sqrt(smallest_rel)} @ {smallest_rel_x}; abs_err = {smallest_rel_abs}')
+
+    print(f'average anomaly relative error found: {sum([item[1][1] for item in extended_results]) / num_anomalies}')
+
+
+def compare_results(n1, n2):
+    _, res1 = read_file_from_number_suffix(n1)
+    _, res2 = read_file_from_number_suffix(n1)
+    res1_dict, res2_dict = dict(res1), dict(res2)
+    score1, score2 = 0, 0
+    ties = 0
+    for fun in res1_dict.keys():
+        if fun in res2_dict.keys():
+            anom1, anom2 = res1_dicts[fun], res2_dict[fun]
+            if anom1 > anom2:
+                score1 += 1
+            elif anom1 < anom2:
+                score2 += 1
+            else:
+                ties += 1
+    print(f'file #{n1} score: {score1}')
+    print(f'file #{n2} score: {score2}')
+    print(f'ties: {ties}')
+
+
+def test_autoduff(anomaly_types=anomaly_types, modes=modes, normalized_modes=[True, False], loss_type = 'rel', use_cached=True):
     # disable logging for performance
     autoduff_logging.disable_most_logging(log)
-    loss_type = 'abs'
     for anomaly_type in anomaly_types:
         for mode in modes:
             for normalized in normalized_modes:
-                autoduff(anomaly_type, loss_type, mode, normalized, use_cached=True)
+                autoduff(anomaly_type, loss_type, mode, normalized, use_cached)
 
 
 
@@ -605,77 +683,76 @@ if __name__ == "__main__":
         loss, _ = generate_loss_funs(fun_name, dtype, device, compose=0)
         return loss(point)
 
-    def test_fuzzer_correctly_computes_losses(torch_fun_name, dtype, device, anomaly_type):
-        f_torch, f_grad_torch, _= torch_funs(torch_fun_name)
-        tvm_fun, f_grad_tvm, _= torch_to_tvm(torch_fun_name, dtype, device)
-        loss, loss_grad = generate_loss_funs(torch_fun_name, dtype, device, anomaly_type)
 
-        fuzz_out = detect_grad_anomaly(torch_fun_name, dtype, device, anomaly_type, total_time=2)
-        for (x_val, actual_loss_val) in fuzz_out.values():
-            x = torch.tensor(x_val)
-            actual_loss = torch.tensor(actual_loss_val)
-            expected_loss = loss(x)
-            assert torch.isclose(actual_loss, expected_loss).item(), "incorrect loss output from fuzzer. At point {}: Expected {}; got {}".format(x, expected_loss, actual_loss)
-        print("[[TEST SUCCESS ]]: fuzzer correctly computes losses")
+    def test_loss_fun_does_compute_loss(torch_fun_name, dtype, device, anomaly_type):
+        loss, loss_grad = generate_loss_funs(torch_fun_name, dtype, device, anomaly_type, 'abs')
+        f_torch, f_grad_torch, _= torch_funs(torch_fun_name)
+        f_tvm, f_grad_tvm, _= torch_to_tvm(torch_fun_name, dtype, device)
+        x = torch.rand([], dtype=parse_torch_dtype(dtype), device=device)
+        actual = loss(x)
+        expected = abs(f_torch(x) - f_tvm(x)) if anomaly_type == 'fun' else abs(f_grad_torch(x) - f_grad_tvm(x))
+        assert torch.isclose(actual, expected), f"loss fun didn't compute expected value: actual={actual}, expected={expected}"
+        log.critical(f"[[ TEST SUCCESS ]]: loss function with anomaly type {anomaly_type} works as expected")
+
+
+    def test_fuzzer_correctly_computes_losses(torch_fun_name, dtype, device, anomaly_type, mode):
+        log.info("testing that fuzzer output loss values match loss function output")
+        loss, loss_grad = generate_loss_funs(torch_fun_name, dtype, device, anomaly_type, 'abs')
+
+        def test(fuzz_out):
+            for (x_val, actual_loss_val) in fuzz_out.values():
+                x = torch.tensor(x_val, dtype=parse_torch_dtype(dtype), device=device)
+                actual_loss = torch.tensor(actual_loss_val, dtype=parse_torch_dtype(dtype), device=device)
+                expected_loss = loss(x)
+                assert torch.isclose(actual_loss, expected_loss).item(), "incorrect loss output from fuzzer. At point {}: Expected {}; got {}".format(x, expected_loss, actual_loss)
+
+        fuzz_out = detect_grad_anomaly(torch_fun_name, dtype, device, anomaly_type, 'abs', mode, False, total_time=2, sga_timeout=10, random_timeout=10)
+        test(fuzz_out)
+
+        log.critical("[[TEST SUCCESS ]]: fuzzer correctly computes losses")
 
     def test_loss_generation_consistent(torch_fun_name, dtype, device, anomaly_type):
-        loss_a, loss_grad_a = generate_loss_funs(torch_fun_name, dtype, device, anomaly_type)
-        loss_b, loss_grad_b = generate_loss_funs(torch_fun_name, dtype, device, anomaly_type)
-        loss_c, loss_grad_c = generate_loss_funs(torch_fun_name, dtype, device, anomaly_type)
-        x = torch.rand([])
-        assert torch.isclose(loss_a(x), loss_b(x)) and torch.isclose(loss_b(x), loss_c(x)), "generated loss funs don't behave equivalently: {}, {}, {}".format(loss_a(x), loss_b(x), loss_c(x))
-        print("[[ TEST SUCCESS ]]: generated loss functions behave equivalently at test point")
+        log.info("testing that multiple generated versions of loss funs with same parameters behave identically at random point")
+        log.info(f"parameters: ({torch_fun_name}, {dtype}, {device}), anomaly_type={anomaly_type}")
+        loss_a, loss_grad_a = generate_loss_funs(torch_fun_name, dtype, device, anomaly_type, 'abs')
+        loss_b, loss_grad_b = generate_loss_funs(torch_fun_name, dtype, device, anomaly_type, 'abs')
+        loss_c, loss_grad_c = generate_loss_funs(torch_fun_name, dtype, device, anomaly_type, 'abs')
+        x = torch.rand([], dtype=parse_torch_dtype(dtype), device=device)
+        assert torch.isclose(loss_a(x), loss_b(x), equal_nan=True) and torch.isclose(loss_b(x), loss_c(x), equal_nan=True), "generated loss funs don't behave equivalently: {}, {}, {}".format(loss_a(x), loss_b(x), loss_c(x))
+        assert torch.isclose(loss_grad_a(x), loss_grad_b(x), equal_nan=True) and torch.isclose(loss_grad_b(x), loss_grad_c(x), equal_nan=True), "generated loss funs don't behave equivalently: {}, {}, {}".format(loss_grad_a(x), loss_grad_b(x), loss_grad_c(x))
+        log.critical("[[ TEST SUCCESS ]]: generated loss functions behave equivalently at test point")
 
 
-    def plot_loss(fun_name, dtype, device, anomaly_type, x_center, x_start=0., x_stop=1.):
-        loss, loss_grad = generate_loss_funs(fun_name, dtype, device, anomaly_type)
+    def plot_loss(fun_name, dtype, device, x_center, win_size=100., n=20):
+        print(f'plotting losses for ({fun_name}, {dtype}, {device})')
+        # f_torch, f_grad_torch, _ = torch_funs(fun_name)
+        f_tvm, f_grad_tvm, _ = torch_to_tvm(fun_name, dtype, device)
+        # loss_rel, loss_rel_grad = generate_loss_funs(fun_name, dtype, device, 'grad', 'rel')
         lift_float = lambda x: torch.tensor(x, dtype=parse_torch_dtype(dtype), device=device)
-        xs = np.linspace(x_start, x_center, num=100) + np.linspace(x_center, x_stop, num=100)
-        ys = [loss(lift_float(x)).item() for x in xs]
-        plt.plot(xs, ys)
-        plt.savefig('{} loss ({}, {}, {})'.format(anomaly_type, fun_name, dtype, device))
 
-    # plot_loss('sin', 'float32', 'cuda:0', 'grad')
-    # plot_loss('sin', 'float32', 'cuda:0', 'fun')
+        xs = np.linspace(x_center-win_size/2, x_center, num=n//2) + np.linspace(x_center, x_center+win_size/2, num=n//2)
 
+        print(f'calculating loss + torch vals + tvm vals')
+        # loss_rel_ys = [loss_rel(lift_float(x)).item() for x in xs]
+        # loss_rel_grad_ys = [loss_rel_grad(lift_float(x)).item() for x in xs]
+        # f_torch_ys = [f_torch(lift_float(x)).item() for x in xs]
+        # f_tvm_ys = [f_tvm(lift_float(x)).item() for x in xs]
+        # f_grad_torch_ys = [f_grad_torch(lift_float(x)).item() for x in xs]
+        f_grad_tvm_ys = [f_grad_tvm(lift_float(x)).item() for x in xs]
 
-    # def test_suite():
-        # test_fuzzer_correctly_computes_losses('sin', 'float32', 'cpu', normalized=True)
-        # sin_derivative_test('float32', 'cpu')
-        # sin_derivative_test('float32', 'cuda:0')
-        # loss_function_test('sin', 'float32', 'cpu')
-        # loss_function_test('sin', 'float32', 'cuda:0')
-        # sga_test('sin', 'float32', 'cpu')
-        # sga_test('sin', 'float32', 'cuda:0')
-        # detect_grad_anomaly_test('sin', 'float32', 'cpu')
-        # detect_grad_anomaly_test('sin', 'float32', 'cuda:0')
-        # loss_function_test('sin', 'float32', 'cuda:0', compose=1)
-        # composed_sin_derivative_test('float32', 'cpu')
-        # composed_sin_derivative_test('float32', 'cuda:0')
-        # tvm_vs_torch_compose_sin(0, 'float32', 'cpu', torch.sin, torch.rand((2,2)))
+        print('plotting calculated values')
+        # plt.plot(xs, loss_rel_ys, color='k')
+        # plt.plot(xs, loss_rel_grad_ys, color='c')
+        # plt.plot(xs, f_torch_ys, color='r')
+        # plt.plot(xs, f_tvm_ys, color='g')
+        # plt.plot(xs, f_grad_torch_ys, color='m')
+        plt.plot(xs, f_grad_tvm_ys, color='y')
+        plt.savefig('{}_{}_{}'.format(fun_name, dtype, device))
 
-    test_autoduff()
-    # detect_grad_anomaly('tanh', 'float16', 'cuda:0', 'grad', 'abs', mode='sga', normalized=False, seed_input=torch.tensor(95.5625, dtype=torch.float16, device='cuda:0'))
-    # test_loss_generation_consistent('sin', 'float32', 'cpu', 'grad')
-    # test_fuzzer_correctly_computes_losses('sin', 'float32', 'cpu', 'grad')
-    # ad_plt.plot_finish(name='fuzz', save=True, show=False)
-    # nearest_float(2.1118e24, 1, 'float32')
+    # test_loss_generation_consistent('reciprocal', 'float64', 'cuda:0', 'fun')
+    # test_loss_generation_consistent('reciprocal', 'float64', 'cuda:0', 'grad')
+    # test_fuzzer_correctly_computes_losses('reciprocal', 'float64', 'cuda:0', 'grad', 'sga')
+    # plot_loss('reciprocal', 'float64', 'cuda:0', 0.)
 
-    # autoduff(use_cached=False)
-    # test_suite()
-    # plot_fuzz('reciprocal', 'float32', 'cpu')
-    # plot_fuzz('reciprocal', 'float32', 'cuda:0')
-    # plot_fuzz('sin', 'float32', 'cuda:0')
-    # plot_compare_searches('tanhshrink', 'float32', 'cuda:0')
-    # plot_compare_searches('reciprocal', 'float32', 'cuda:0')
-    # plot_loss('reciprocal', 'float32', 'cpu')
-    # plot_loss('reciprocal', 'float32', 'cuda:0')
-    # plot_loss('tanhshrink', 'float32', 'cpu')
-    # plot_loss('tanhshrink', 'float32', 'cuda:0')
-    # gradient_anomaly_detector()
-    # compare_torch_tvm_fun('tanhshrink', 'float32', 'cpu')
-    # plot_loss('reciprocal', 'float32', 'cpu')
-    # compare_torch_tvm_fun('reciprocal', 'float32', 'cpu')
-    # compare_torch_tvm_fun('tanhshrink', 'float32', 'cuda:0')
-    # results = gradient_anomaly_detector_par()
-    # analyze_search_results({('tan', 'float32', 'cpu') : {0 : (torch.tensor(-1.3110e15), torch.tensor(3.9063e11))}})
+    test_autoduff(use_cached=False)
+
